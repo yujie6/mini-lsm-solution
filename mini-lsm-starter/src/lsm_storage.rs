@@ -312,15 +312,26 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // First acquire the state lock to prevent concurrent freezes
-        // Now write to the current memtable
-        let state = self.state.read();
-        state.memtable.put(key, value)?;
+        // Write to the current memtable first
+        {
+            let state = self.state.read();
+            state.memtable.put(key, value)?;
+        }
 
-        if state.memtable.approximate_size() >= self.options.target_sst_size {
-            // First acquire the state lock to prevent concurrent freezes
+        // Check size and maybe freeze after releasing the read lock
+        let should_freeze = {
+            let state = self.state.read();
+            state.memtable.approximate_size() >= self.options.target_sst_size
+        };
+
+        if should_freeze {
             let state_lock = self.state_lock.lock();
-            if state.memtable.approximate_size() >= self.options.target_sst_size {
+            // Double check after acquiring the lock
+            let should_freeze = {
+                let state = self.state.read();
+                state.memtable.approximate_size() >= self.options.target_sst_size
+            };
+            if should_freeze {
                 self.force_freeze_memtable(&state_lock)?;
             }
         }
@@ -330,14 +341,26 @@ impl LsmStorageInner {
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        // Now delete from the current memtable
-        let state = self.state.read();
-        state.memtable.put(key, b" ")?;
+        // Write tombstone first
+        {
+            let state = self.state.read();
+            state.memtable.put(key, b" ")?;
+        }
 
-        if state.memtable.approximate_size() >= self.options.target_sst_size {
-            // First acquire the state lock to prevent concurrent freezes
+        // Check size and maybe freeze after releasing the read lock
+        let should_freeze = {
+            let state = self.state.read();
+            state.memtable.approximate_size() >= self.options.target_sst_size
+        };
+
+        if should_freeze {
             let state_lock = self.state_lock.lock();
-            if state.memtable.approximate_size() >= self.options.target_sst_size {
+            // Double check after acquiring the lock
+            let should_freeze = {
+                let state = self.state.read();
+                state.memtable.approximate_size() >= self.options.target_sst_size
+            };
+            if should_freeze {
                 self.force_freeze_memtable(&state_lock)?;
             }
         }
@@ -365,25 +388,27 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        // Create new memtable outside the write lock
         let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
-        {
-            let mut state = self.state.write();
-            let mut imm = state.imm_memtables.clone();
 
-            imm.insert(0, state.memtable.clone());
+        // Take write lock and update state
+        let mut state = self.state.write();
+        let mut imm = state.imm_memtables.clone();
 
-            // Create new state with updated memtables
-            let new_state = Arc::new(LsmStorageState {
-                memtable: new_memtable,
-                imm_memtables: imm,
-                l0_sstables: state.l0_sstables.clone(),
-                levels: state.levels.clone(),
-                sstables: state.sstables.clone(),
-            });
+        imm.insert(0, state.memtable.clone());
 
-            *state = new_state;
-        }
+        // Create new state with updated memtables
+        let new_state = Arc::new(LsmStorageState {
+            memtable: new_memtable,
+            imm_memtables: imm,
+            l0_sstables: state.l0_sstables.clone(),
+            levels: state.levels.clone(),
+            sstables: state.sstables.clone(),
+        });
+
+        *state = new_state;
+
         Ok(())
     }
 
